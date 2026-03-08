@@ -407,6 +407,7 @@ export default defineConfig({
   title: 'sing-box Internals',
   description: 'Complete technical analysis of sing-box for reimplementation',
   head: [['link', { rel: 'icon', href: '/favicon.ico' }]],
+  sitemap: { hostname: 'https://singbox-internals.hidandelion.com' },
   locales: {
     root: {
       label: 'English',
