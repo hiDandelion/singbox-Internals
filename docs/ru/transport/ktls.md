@@ -1,0 +1,186 @@
+# Kernel TLS (kTLS)
+
+Исходный код: `common/tls/ktls.go`, `common/ktls/ktls.go`, `common/ktls/ktls_linux.go`, `common/ktls/ktls_cipher_suites_linux.go`, `common/ktls/ktls_const.go`, `common/ktls/ktls_write.go`, `common/ktls/ktls_read.go`, `common/ktls/ktls_read_wait.go`, `common/ktls/ktls_close.go`
+
+## Обзор
+
+kTLS выгружает шифрование/дешифрование TLS в ядро Linux, обеспечивая операции sendfile и splice без копирования (zero-copy). Функция ограничена условиями сборки: `linux && go1.25 && badlinkname`.
+
+Поддерживается только TLS 1.3. Реализация обрабатывает как TX (отправку), так и RX (приём) выгрузки.
+
+## Уровень интеграции
+
+Файл `common/tls/ktls.go` предоставляет типы-обёртки, перехватывающие завершение TLS-рукопожатия:
+
+```go
+type KTLSClientConfig struct {
+    Config
+    logger             logger.ContextLogger
+    kernelTx, kernelRx bool
+}
+
+func (w *KTLSClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) (aTLS.Conn, error) {
+    tlsConn, err := aTLS.ClientHandshake(ctx, conn, w.Config)
+    if err != nil { return nil, err }
+    kConn, err := ktls.NewConn(ctx, w.logger, tlsConn, w.kernelTx, w.kernelRx)
+    if err != nil {
+        tlsConn.Close()
+        return nil, E.Cause(err, "initialize kernel TLS")
+    }
+    return kConn, nil
+}
+```
+
+Аналогично для серверной стороны с `KTlSServerConfig`.
+
+## Инициализация Conn
+
+```go
+type Conn struct {
+    aTLS.Conn
+    ctx             context.Context
+    logger          logger.ContextLogger
+    conn            net.Conn
+    rawConn         *badtls.RawConn
+    syscallConn     syscall.Conn
+    rawSyscallConn  syscall.RawConn
+    readWaitOptions N.ReadWaitOptions
+    kernelTx        bool
+    kernelRx        bool
+    pendingRxSplice bool
+}
+```
+
+Шаги инициализации:
+
+1. **Загрузка модуля ядра**: `Load()` обеспечивает загрузку модуля ядра `tls` через `modprobe`
+2. **Извлечение syscall.Conn**: Базовый `net.Conn` должен реализовывать `syscall.Conn` для доступа к необработанному файловому дескриптору
+3. **Извлечение необработанного состояния TLS**: Используется `badtls.NewRawConn` для доступа к внутреннему состоянию TLS (ключи шифрования, IV, номера последовательностей)
+4. **Проверка TLS 1.3**: Поддерживается только `tls.VersionTLS13`
+5. **Обработка ожидающих записей**: Извлечение всех пост-рукопожатных сообщений из буфера TLS
+6. **Настройка ядра**: Вызов `setupKernel` с извлечённым криптографическим состоянием
+
+## Настройка ядра (Linux)
+
+```go
+func (c *Conn) setupKernel(txOffload, rxOffload bool) error {
+    // 1. Set TCP_ULP to "tls"
+    rawSyscallConn.Control(func(fd uintptr) {
+        unix.SetsockoptString(int(fd), unix.SOL_TCP, unix.TCP_ULP, "tls")
+    })
+
+    // 2. Extract cipher info and setup TX/RX
+    cipherInfo := kernelCipher(c.rawConn)
+    if txOffload {
+        unix.SetsockoptString(int(fd), SOL_TLS, TLS_TX, cipherInfo.txData)
+        c.kernelTx = true
+    }
+    if rxOffload {
+        unix.SetsockoptString(int(fd), SOL_TLS, TLS_RX, cipherInfo.rxData)
+        c.kernelRx = true
+    }
+
+    // 3. Enable TX zerocopy (optional)
+    unix.SetsockoptInt(int(fd), SOL_TLS, TLS_TX_ZEROCOPY_RO, 1)
+    // 4. Disable RX padding (optional)
+    unix.SetsockoptInt(int(fd), SOL_TLS, TLS_RX_EXPECT_NO_PAD, 1)
+}
+```
+
+### Поддерживаемые наборы шифров
+
+Маппер шифров ядра преобразует идентификаторы наборов шифров TLS в специфичные для ядра криптографические структуры:
+
+| Набор шифров TLS | Шифр ядра | Размер ключа |
+|------------------|---------------|----------|
+| `TLS_AES_128_GCM_SHA256` | `TLS_CIPHER_AES_GCM_128` | 16 байт |
+| `TLS_AES_256_GCM_SHA384` | `TLS_CIPHER_AES_GCM_256` | 32 байта |
+| `TLS_CHACHA20_POLY1305_SHA256` | `TLS_CIPHER_CHACHA20_POLY1305` | 32 байта |
+| `TLS_AES_128_CCM_SHA256` | `TLS_CIPHER_AES_CCM_128` | 16 байт |
+
+Каждая структура шифра содержит: версию TLS, тип шифра, IV, ключ, соль и номер последовательности записи, извлечённые из внутреннего состояния TLS-соединения.
+
+### Определение версии ядра
+
+Доступность функций зависит от версии ядра:
+
+| Функция | Минимальная версия ядра |
+|---------|---------------|
+| kTLS базовый (TX) | 4.13 |
+| kTLS RX | 4.17 |
+| AES-256-GCM | 5.1 |
+| ChaCha20-Poly1305 | 5.11 |
+| TX zero-copy | 5.19 |
+| RX без заполнения | 6.0 |
+| Обновление ключей | 6.14 |
+
+## Поддержка Splice
+
+kTLS предоставляет `SyscallConnForRead` и `SyscallConnForWrite` для обеспечения splice на уровне ядра:
+
+```go
+func (c *Conn) SyscallConnForRead() syscall.RawConn {
+    if !c.kernelRx { return nil }
+    if !*c.rawConn.IsClient {
+        c.logger.WarnContext(c.ctx, "ktls: RX splice is unavailable on the server side")
+        return nil
+    }
+    return c.rawSyscallConn
+}
+
+func (c *Conn) SyscallConnForWrite() syscall.RawConn {
+    if !c.kernelTx { return nil }
+    return c.rawSyscallConn
+}
+```
+
+RX splice доступен только на стороне клиента из-за известного ограничения ядра.
+
+## Обработка ошибок
+
+Записи, не содержащие данные приложения, при RX splice возвращают `EINVAL`:
+
+```go
+func (c *Conn) HandleSyscallReadError(inputErr error) ([]byte, error) {
+    if errors.Is(inputErr, unix.EINVAL) {
+        c.pendingRxSplice = true
+        err := c.readRecord()  // Read and process the non-app record
+        // Return any buffered application data
+    } else if errors.Is(inputErr, unix.EBADMSG) {
+        return nil, c.rawConn.In.SetErrorLocked(c.sendAlert(alertBadRecordMAC))
+    }
+}
+```
+
+## Путь записи
+
+Путь TX-записи ядра использует `sendmsg` с управляющими сообщениями для указания типа записи TLS:
+
+```go
+func (c *Conn) writeKernelRecord(b []byte, recordType byte) (int, error) {
+    // Uses cmsg with SOL_TLS/TLS_SET_RECORD_TYPE
+    // Splits writes at MSS boundaries for optimal performance
+}
+```
+
+## Закрытие
+
+При закрытии отправляется TLS-оповещение close_notify через ядро:
+
+```go
+func (c *Conn) Close() error {
+    if c.kernelTx {
+        c.writeKernelRecord([]byte{alertCloseNotify}, recordTypeAlert)
+    }
+    return c.conn.Close()
+}
+```
+
+## Замечания по производительности
+
+Авторы sing-box явно предупреждают о производительности kTLS:
+
+- kTLS TX полезен только в сценариях с `sendfile`/`splice` (раздача файлов, проксирование между kTLS-соединениями)
+- kTLS RX «определённо снизит производительность» согласно предупреждениям в исходном коде
+- Реализация TLS в ядре избегает переключений контекста для криптографии, но добавляет накладные расходы на формирование записей
+- kTLS наиболее выгоден для сценариев с высокой пропускной способностью и низкой нагрузкой на CPU
